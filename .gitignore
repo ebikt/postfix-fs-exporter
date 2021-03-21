@@ -1,3 +1,2 @@
 .*.sw?
-/go.sum
 /postfix-fs-exporter
