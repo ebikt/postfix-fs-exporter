@@ -454,7 +454,7 @@ func (e *Exporter) InfluxHandler() (func(http.ResponseWriter, *http.Request)) {
 var (
     test     = flag.Bool("test", false, "test run - gather methrics and print them")
     influx   = flag.Bool("test-influx", false, "single run - gather methrics and print them in influx line format")
-    addr     = flag.String("web.listen_address", "127.0.0.1:9991", "The address to listen on for HTTP requests.")
+    addr     = flag.String("web.listen-address", "127.0.0.1:9991", "The address to listen on for HTTP requests.")
 
     spoolDir  = flag.String("spooldir", "/var/spool/postfix/", "Postfix directory with queue directories")
     queueDirs = flag.String("queuedirs", "incoming active deferred bounce corrupt", "Space separated names of queues")
