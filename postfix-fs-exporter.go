@@ -2,6 +2,7 @@ package main
 
 import (
     "bufio"
+    "bytes"
     "flag"
     "fmt"
     "io"
@@ -15,10 +16,14 @@ import (
     "syscall"
     "time"
 
+    "golang.org/x/sys/unix"
+
     "github.com/prometheus/common/expfmt"
     "github.com/prometheus/common/version"
     "github.com/prometheus/client_golang/prometheus"
     "github.com/prometheus/client_golang/prometheus/promhttp"
+
+    "github.com/yookoala/realpath"
 )
 
 // {{{ prometheus vars
@@ -28,37 +33,37 @@ var (
     queue_count = prometheus.NewDesc(
 	prometheus.BuildFQName(namespace, "", "queue_count"),
 	"How many files are in queue directory",
-	[]string{"queue"}, nil,
+	[]string{"instance", "queue"}, nil,
     )
     queue_size = prometheus.NewDesc(
 	prometheus.BuildFQName(namespace, "", "queue_size"),
 	"Total size of files in directory",
-	[]string{"queue"}, nil,
+	[]string{"instance", "queue"}, nil,
     )
     queue_fssize = prometheus.NewDesc(
 	prometheus.BuildFQName(namespace, "", "queue_fssize"),
 	"Total size of queue on filesystem",
-	[]string{"queue"}, nil,
+	[]string{"instance", "queue"}, nil,
     )
     queue_age = prometheus.NewDesc(
 	prometheus.BuildFQName(namespace, "", "queue_age"),
 	"Age (in seconds) of last file in directory",
-	[]string{"queue"}, nil,
+	[]string{"instance", "queue"}, nil,
     )
     queue_error = prometheus.NewDesc(
 	prometheus.BuildFQName(namespace, "", "queue_error"),
 	"Was there error when collecting queue",
-	[]string{"queue","error"}, nil,
+	[]string{"instance", "queue", "error"}, nil,
     )
     proc_count = prometheus.NewDesc(
 	prometheus.BuildFQName(namespace, "", "proc_count"),
 	"Count of postfix processes",
-	[]string{"progname","progbin"}, nil,
+	[]string{"instance", "progname", "progbin"}, nil,
     )
     proc_max = prometheus.NewDesc(
 	prometheus.BuildFQName(namespace, "", "proc_max"),
 	"Configured maximum of postfix processes",
-	[]string{"progname","progbin"}, nil,
+	[]string{"instance", "progname", "progbin"}, nil,
     )
 )
 // }}}
@@ -72,9 +77,24 @@ func OpenAt(dir *os.File, name string) (*os.File, error) { // {{{
     }
 } // }}}
 
+func ReadlinkAt(dir *os.File, path string) (string, error) { // {{{
+	// Allocate the buffer exponentially like os.Readlink does.
+	for bufsz := 128; ; bufsz *= 2 {
+		buf := make([]byte, bufsz)
+		n, err := unix.Readlinkat(int(dir.Fd()), path, buf)
+		if err != nil {
+			return "", err
+		}
+		if n < bufsz {
+			return string(buf[0:n]), nil
+		}
+	}
+} // }}}
+
 type QueueDir struct { // {{{
-    name string
-    dir  string
+    name     string
+    instance string
+    dir      string
 }
 
 func countDir(dir *os.File, depth int) (int, int64, int64, int64, error) {
@@ -154,19 +174,22 @@ func (qd *QueueDir) Collect(now time.Time) (int, int64, int64, int64, error) {
 // }}}
 
 type PostfixProc struct { // {{{
-    maxValue map[string]int
-    curValue map[string]int
+    instanceDirs map[string]string
+    maxValue map[string]map[string]int
+    curValue map[string]map[string]int
+    sortedInstances []string
 }
 
 var emptyLine  = regexp.MustCompile("^[[:space:]\\x00]*(?:$|#)")
 var emptyStart = regexp.MustCompile("^[[:space:]\\x00]")
 var wordsRe    = regexp.MustCompile("[^[:space:]\\x00]+")
 
-func (p *PostfixProc) ParseMasterCf(mastercf string) error {
-    p.maxValue = make(map[string]int)
-    fd, err := os.Open(mastercf)
+func (p *PostfixProc) ParseMasterCf(instance string, masterCf string) error {
+    maxValue := make(map[string]int)
+    curValue := make(map[string]int)
+    fd, err := os.Open(masterCf)
     if (err != nil) {
-	return err
+	return nil
     }
     defer fd.Close()
     scanner := bufio.NewScanner(fd)
@@ -191,19 +214,21 @@ func (p *PostfixProc) ParseMasterCf(mastercf string) error {
 		case 8:
 		    bin = string(word)
 		    if limit > 0 {
-			p.maxValue[name + " " + bin] = limit
+			maxValue[name + " " + bin] = limit
+			curValue[name + " " + bin] = 0
 		    }
 	    }
 	}
     }
+    p.maxValue[instance] = maxValue
+    p.curValue[instance] = maxValue
     return nil
 }
 
-func (p *PostfixProc) WalkProc(procdir string, user uint32) error {
+func (p *PostfixProc) WalkProc(procDir string, user uint32) error {
     if (user == 0) { return fmt.Errorf("Refusing to scan /proc for root processes") }
-    proc, err := os.Open(procdir)
+    proc, err := os.Open(procDir)
     if (err != nil) { return err }
-    p.curValue = make(map[string]int)
 
     var dirErr error = nil
     cmdline := make([]byte,8192)
@@ -218,6 +243,11 @@ func (p *PostfixProc) WalkProc(procdir string, user uint32) error {
 		    userMatches = user == sys.Uid
 		}
 		if userMatches {
+		    dir, err := ReadlinkAt(proc, entry.Name() + "/cwd")
+		    if (err != nil) { continue; }
+		    instance := p.instanceDirs[dir]
+		    if (instance == "") { continue; }
+
 		    cmdfd, err := OpenAt(proc, entry.Name() + "/cmdline")
 		    var cmdwords [][]byte
 		    if (err == nil) {
@@ -243,9 +273,9 @@ func (p *PostfixProc) WalkProc(procdir string, user uint32) error {
 			}
 		    }
 		    if name == "" { name = bin }
-		    if bin != "" {
+		    if bin != "" && err == nil {
 			key := name + " " + bin
-			p.curValue[key] += 1
+			p.curValue[instance][key] += 1
 		    }
 		}
 	    }
@@ -253,15 +283,18 @@ func (p *PostfixProc) WalkProc(procdir string, user uint32) error {
     }
     return nil
 }
+
 // }}}
 
 type Exporter struct { // {{{
-    queueDirs  []QueueDir
+    directories []string
     masterCf   string
+    multiCf    string
     procDir    string
+    spoolDir   string
 }
 
-func NewExporter(spooldir string, queuenames string, master_cf string, proc_dir string) *Exporter {
+func NewExporter(spooldir string, queuenames string, master_cf string, multi_cf string, proc_dir string) *Exporter {
     var sp string
     if (strings.HasSuffix(spooldir,"/")) {
 	sp = spooldir
@@ -269,23 +302,126 @@ func NewExporter(spooldir string, queuenames string, master_cf string, proc_dir 
 	sp = spooldir + "/"
     }
 
-    actual_dirs := wordsRe.FindAllString(queuenames,-1)
-
-    qd := make([]QueueDir, len(actual_dirs))
-
-    for i, name := range actual_dirs {
-	qd[i].name = name
-	qd[i].dir = sp + name + "/"
-    }
+    directories := wordsRe.FindAllString(queuenames,-1)
 
     return &Exporter{
-	queueDirs: qd,
+	directories: directories,
 	masterCf: master_cf,
+	multiCf: multi_cf,
 	procDir: proc_dir,
+	spoolDir: sp,
     }
 }
 
-func (e *Exporter) getProc() (*PostfixProc, error) {
+var keyRe = regexp.MustCompile("^[[:space:]]*([[:word:]]+)[[:space:]]*=[[:space:]]*")
+func parseMain(fileName string) (map[string]string, error) {
+    fd, err := os.Open(fileName)
+    if (err != nil) {
+	return nil, err
+    }
+    defer fd.Close()
+    scanner := bufio.NewScanner(fd)
+    ret := make(map[string]string)
+    for scanner.Scan() {
+	lb := scanner.Bytes()
+	keyA := keyRe.FindSubmatch(lb)
+	if (keyA == nil) { continue }
+	ret[ string(bytes.ToLower(keyA[1])) ] = string(bytes.TrimSpace(lb[ len(keyA[0]) : ] ))
+    }
+    return ret, nil
+}
+
+func TryReal(fpath string) (string) {
+    rpath, err := realpath.Realpath(fpath)
+    if err == nil { return rpath }
+    return fpath
+}
+
+func (e *Exporter) RealSpool(mainCf map[string]string, err error) (string) {
+    var fpath string
+    if err != nil {
+	fpath = ""
+    } else {
+	fpath = mainCf["queue_directory"]
+    }
+    if (fpath == "") {
+	fpath = e.spoolDir
+    }
+    return TryReal(fpath)
+}
+
+var postfixDirsRe = regexp.MustCompile("[^\x00, \t\r\n]+")
+
+
+
+func (e *Exporter) parseMulti() ([]QueueDir, *PostfixProc, error) {
+    multiCf, err := parseMain(e.multiCf)
+    if (err != nil) {
+	multiCf = make(map[string]string)
+    }
+    var cfDirs []string
+    if (strings.ToLower(multiCf["multi_instance_enable"]) == "yes") {
+	cfDirs = postfixDirsRe.FindAllString(multiCf["multi_instance_directories"], -1)
+    }
+    var masterCfs = make(map[string]string)
+    var queueDirs = make(map[string]string)
+    if (cfDirs == nil || len(cfDirs) == 0) {
+	masterCfs["(single)"] = e.masterCf
+	queueDirs["(single)"] = e.RealSpool(multiCf, nil)
+    } else {
+	for _, dir := range(cfDirs) {
+	    masterCfs[dir] = dir + "/master.cf"
+	    queueDirs[dir] = e.RealSpool(parseMain(dir + "/main.cf"))
+	}
+    }
+    i := 0
+    p := &PostfixProc{}
+    p.sortedInstances = make([]string, len(queueDirs))
+    p.maxValue = make(map[string]map[string]int)
+    p.curValue = make(map[string]map[string]int)
+    for instance := range(queueDirs) {
+      p.sortedInstances[i] = instance
+      i += 1
+    }
+    sort.Strings(p.sortedInstances)
+    i = 0
+    qd := make([]QueueDir, len(queueDirs) * len(e.directories))
+    for _, instance := range(p.sortedInstances) {
+	spoolDir := queueDirs[instance]
+	var sp string
+	if (strings.HasSuffix(spoolDir,"/")) {
+	   sp = spoolDir
+	} else {
+	   sp = spoolDir + "/"
+	}
+
+	for _, dir := range(e.directories) {
+	    qd[i].instance = instance
+	    qd[i].name = dir
+	    qd[i].dir = sp + dir + "/"
+	    i += 1
+	}
+    }
+    p.instanceDirs = queueDirs
+
+    for instance, masterCf := range(masterCfs) {
+	p.ParseMasterCf(instance, masterCf) // ignore error
+    }
+    return qd, p, nil
+}
+
+func (e *Exporter) WalkProc(p *PostfixProc) error {
+    uid := os.Getuid()
+    var uuid uint32
+    if uid < 1 {
+	uuid = 0
+    } else {
+	uuid = uint32(uid)
+    }
+    return p.WalkProc(e.procDir, uuid)
+}
+
+func (e *Exporter) getProc(masterCfs map[string]string ) (*PostfixProc, error) {
     p := &PostfixProc{}
     uid := os.Getuid()
     var uuid uint32
@@ -296,7 +432,9 @@ func (e *Exporter) getProc() (*PostfixProc, error) {
     }
     err := p.WalkProc(e.procDir, uuid)
     if (err != nil) { return nil, err }
-    err = p.ParseMasterCf(e.masterCf)
+    for instance, masterCf := range masterCfs {
+	p.ParseMasterCf(instance, masterCf) // ignore error
+    }
     return p, err
 }
 
@@ -311,7 +449,9 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
     now := time.Now()
-    for _, qd := range e.queueDirs {
+    queues, p, err := e.parseMulti();
+    if (err != nil) { return; }
+    for _, qd := range queues {
 
 	count, size, fssize, age, err := qd.Collect(now)
 	var (
@@ -321,16 +461,16 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 
 	if (count >= 0) {
 	    ch <- prometheus.MustNewConstMetric(
-		queue_count, prometheus.GaugeValue, float64(count), qd.name,
+		queue_count, prometheus.GaugeValue, float64(count), qd.instance, qd.name,
 	    )
 	    ch <- prometheus.MustNewConstMetric(
-		queue_size, prometheus.GaugeValue, float64(size), qd.name,
+		queue_size, prometheus.GaugeValue, float64(size), qd.instance, qd.name,
 	    )
 	    ch <- prometheus.MustNewConstMetric(
-		queue_fssize, prometheus.GaugeValue, float64(fssize), qd.name,
+		queue_fssize, prometheus.GaugeValue, float64(fssize), qd.instance, qd.name,
 	    )
 	    ch <- prometheus.MustNewConstMetric(
-		queue_age, prometheus.GaugeValue, float64(age), qd.name,
+		queue_age, prometheus.GaugeValue, float64(age), qd.instance, qd.name,
 	    )
 	    if (err == nil) {
 		errVal = 0
@@ -346,32 +486,33 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	    errStr = ""
 	}
 	ch <- prometheus.MustNewConstMetric(
-	    queue_error, prometheus.GaugeValue, float64(errVal), qd.name, errStr,
+	    queue_error, prometheus.GaugeValue, float64(errVal), qd.instance, qd.name, errStr,
 	)
     }
-    p, _ := e.getProc()
     if p != nil {
-	keySet := make(map[string]bool)
-	for k := range p.curValue { keySet[k] = true }
-	for k := range p.maxValue { keySet[k] = true }
-	keys := make([]string, len(keySet))
-	i:= 0
-	for k := range keySet {
-	    keys[i] = k
-	    i++
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-	    kk := strings.SplitN(k, " ", 2)
-	    if len (kk) < 2 { continue }
-	    ch <- prometheus.MustNewConstMetric(
-		proc_count, prometheus.GaugeValue, float64(p.curValue[k]), kk[0], kk[1],
-	    )
-	    max := p.maxValue[k]
-	    if (max > 0) {
+	e.WalkProc(p)
+	for _, instance:= range p.sortedInstances {
+	    curValue := p.curValue[instance]
+	    maxValue := p.maxValue[instance]
+	    keys := make([]string, len(curValue))
+	    i := 0
+	    for k := range curValue {
+	      keys[i] = k
+	      i++
+	    }
+	    sort.Strings(keys)
+	    for _, k := range keys {
+		kk := strings.SplitN(k, " ", 2)
+		if len (kk) < 2 { continue }
 		ch <- prometheus.MustNewConstMetric(
-		    proc_max, prometheus.GaugeValue, float64(max), kk[0], kk[1],
+		    proc_count, prometheus.GaugeValue, float64(curValue[k]), instance, kk[0], kk[1],
 		)
+		max := maxValue[k]
+		if (max > 0) {
+		    ch <- prometheus.MustNewConstMetric(
+			proc_max, prometheus.GaugeValue, float64(max), instance, kk[0], kk[1],
+		    )
+		}
 	    }
 	}
     }
@@ -393,7 +534,10 @@ func (e *Exporter) Influxdb(writer io.Writer) {
     now := time.Now()
     nowi := now.UnixNano()
 
-    for _, qd := range e.queueDirs {
+    queues, p, err := e.parseMulti()
+    if (err != nil) { return; }
+
+    for _, qd := range queues {
 	count, size, fssize, age, err := qd.Collect(now)
 	var errStr string = ""
 	if (err != nil) {
@@ -408,37 +552,42 @@ func (e *Exporter) Influxdb(writer io.Writer) {
 	if (count >=0 ) {
 	    errval := 0
 	    if (err != nil) { errval = 1 }
-	    fmt.Fprintf(writer, "%v_queue,queue=%v,error=%v count=%di,size=%di,fssize=%di,age=%di,errval=%di %v\n",
-	                namespace, qd.name, errStr, count, size, fssize, agei, errval, nowi)
+	    fmt.Fprintf(writer, "%v_queue,instance=%v,queue=%v,error=%v count=%di,size=%di,fssize=%di,age=%di,errval=%di %v\n",
+	                namespace, qd.instance, qd.name, errStr, count, size, fssize, agei, errval, nowi)
 	} else {
-	    fmt.Fprintf(writer, "%v_queue,queue=%v,error=%v errval=2i %v\n", namespace, qd.name, errStr, nowi)
+	    fmt.Fprintf(writer, "%v_queue,instance=%v,queue=%v,error=%v errval=2i %v\n", namespace, qd.instance, qd.name, errStr, nowi)
 	}
     }
 
-    p, _ := e.getProc()
     if p != nil {
-	keySet := make(map[string]bool)
-	for k := range p.curValue { keySet[k] = true }
-	for k := range p.maxValue { keySet[k] = true }
-	keys := make([]string, len(keySet))
-	i:= 0
-	for k := range keySet {
-	    keys[i] = k
-	    i++
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-	    keyStr := dangerousChars.ReplaceAllString(k, "~")
-	    keyStr = escapeChars.ReplaceAllString(keyStr, "\\$1")
-	    keyStr = "progname=" + strings.Replace(keyStr, " ", ",progbin=", 1)
-	    keyStr = whiteChars.ReplaceAllString(keyStr, "\\ ")
-	    max := p.maxValue[k]
-	    if (max > 0) {
-		fmt.Fprintf(writer, "%v_proc,%v count=%di,max=%di %v\n",
-		            namespace, keyStr, p.curValue[k], max, nowi)
-	    } else {
-		fmt.Fprintf(writer, "%v_proc,%v count=%di %v\n",
-		            namespace, keyStr, p.curValue[k], nowi)
+	e.WalkProc(p)
+	for _, instance := range p.sortedInstances {
+	    instanceStr := dangerousChars.ReplaceAllString(instance, "~")
+	    instanceStr = escapeChars.ReplaceAllString(instanceStr, "\\$1")
+	    instanceStr = whiteChars.ReplaceAllString(instanceStr, "\\ ")
+	    curValue := p.curValue[instance]
+	    maxValue := p.maxValue[instance]
+	    keys := make([]string, len(curValue))
+	    i := 0
+	    for k := range curValue {
+	      keys[i] = k
+	      i++
+	    }
+	    sort.Strings(keys)
+	    sort.Strings(keys)
+	    for _, k := range keys {
+		keyStr := dangerousChars.ReplaceAllString(k, "~")
+		keyStr = escapeChars.ReplaceAllString(keyStr, "\\$1")
+		keyStr = "progname=" + strings.Replace(keyStr, " ", ",progbin=", 1)
+		keyStr = whiteChars.ReplaceAllString(keyStr, "\\ ")
+		max := maxValue[k]
+		if (max > 0) {
+		    fmt.Fprintf(writer, "%v_proc,instance=%v,%v count=%di,max=%di %v\n",
+				namespace, instanceStr, keyStr, curValue[k], max, nowi)
+		} else {
+		    fmt.Fprintf(writer, "%v_proc,instance=%v,%v count=%di %v\n",
+				namespace, instanceStr, keyStr, curValue[k], nowi)
+		}
 	    }
 	}
     }
@@ -460,6 +609,7 @@ var (
     queueDirs = flag.String("queuedirs", "incoming active deferred bounce corrupt", "Space separated names of queues")
     procDir   = flag.String("proc", "/proc", "procfs mount directory")
     masterCf  = flag.String("mastercf", "/etc/postfix/master.cf", "Postfix master.cf, to parse maximum number of processes")
+    multiCf   = flag.String("multicf", "/etc/postfix/main.cf", "Postfix main.cf, to parse for postfix multi_instance_enable");
 )
 
 func main() { // {{{
@@ -467,7 +617,7 @@ func main() { // {{{
 
     flag.Parse()
 
-    exporter := NewExporter(*spoolDir, *queueDirs, *masterCf, *procDir)
+    exporter := NewExporter(*spoolDir, *queueDirs, *masterCf, *multiCf, *procDir)
     if *influx {
 	exporter.Influxdb(os.Stdout);
 	os.Exit(0);
