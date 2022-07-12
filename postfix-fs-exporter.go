@@ -15,6 +15,7 @@ import (
     "strconv"
     "syscall"
     "time"
+    "os/user"
 
     "golang.org/x/sys/unix"
 
@@ -67,6 +68,10 @@ var (
     )
 )
 // }}}
+
+var (
+    debug = false
+)
 
 func OpenAt(dir *os.File, name string) (*os.File, error) { // {{{
     fdRaw, err := syscall.Openat(int(dir.Fd()), name, os.O_RDONLY, 0)
@@ -221,11 +226,13 @@ func (p *PostfixProc) ParseMasterCf(instance string, masterCf string) error {
 	}
     }
     p.maxValue[instance] = maxValue
-    p.curValue[instance] = maxValue
+    p.curValue[instance] = curValue
     return nil
 }
 
-func (p *PostfixProc) WalkProc(procDir string, user uint32) error {
+func (p *PostfixProc) WalkProc(procDir string, user int) error {
+    check_user := user >= 0
+    uid := uint32(user)
     if (user == 0) { return fmt.Errorf("Refusing to scan /proc for root processes") }
     proc, err := os.Open(procDir)
     if (err != nil) { return err }
@@ -233,17 +240,29 @@ func (p *PostfixProc) WalkProc(procDir string, user uint32) error {
     var dirErr error = nil
     cmdline := make([]byte,8192)
 
+    if (debug) {
+	fmt.Fprintf(os.Stderr, "Instances %v\n", len(p.instanceDirs))
+	for instX, dirX := range(p.instanceDirs) {
+	    fmt.Fprintf(os.Stderr, "Instance |%v| -> dir |%v|\n", instX, dirX)
+	}
+    }
+
     for dirErr == nil {
 	var entries []os.FileInfo
 	entries, dirErr = proc.Readdir(128)
 	if dirErr == nil {
 	    for _, entry := range entries {
-		userMatches := false
-		if sys, ok := entry.Sys().(*syscall.Stat_t); ok {
-		    userMatches = user == sys.Uid
+		userMatches := !check_user
+		if (check_user) {
+		    if sys, ok := entry.Sys().(*syscall.Stat_t); ok {
+			userMatches = uid == sys.Uid
+		    }
 		}
 		if userMatches {
 		    dir, err := ReadlinkAt(proc, entry.Name() + "/cwd")
+		    if (debug) {
+			fmt.Fprintf(os.Stderr, "Process %v, currdir %v, error %v, instnce %v\n", entry.Name(), dir, err, p.instanceDirs[dir])
+		    }
 		    if (err != nil) { continue; }
 		    instance := p.instanceDirs[dir]
 		    if (instance == "") { continue; }
@@ -292,9 +311,10 @@ type Exporter struct { // {{{
     multiCf    string
     procDir    string
     spoolDir   string
+    uid        int
 }
 
-func NewExporter(spooldir string, queuenames string, master_cf string, multi_cf string, proc_dir string) *Exporter {
+func NewExporter(spooldir string, queuenames string, master_cf string, multi_cf string, proc_dir string, uid int) *Exporter {
     var sp string
     if (strings.HasSuffix(spooldir,"/")) {
 	sp = spooldir
@@ -310,6 +330,7 @@ func NewExporter(spooldir string, queuenames string, master_cf string, multi_cf 
 	multiCf: multi_cf,
 	procDir: proc_dir,
 	spoolDir: sp,
+	uid: uid,
     }
 }
 
@@ -365,17 +386,23 @@ func (e *Exporter) parseMulti() ([]QueueDir, *PostfixProc, error) {
     }
     var masterCfs = make(map[string]string)
     var queueDirs = make(map[string]string)
+    var dir2instance = make(map[string]string)
     if (cfDirs == nil || len(cfDirs) == 0) {
 	masterCfs["(single)"] = e.masterCf
-	queueDirs["(single)"] = e.RealSpool(multiCf, nil)
+	d := e.RealSpool(multiCf, nil)
+	queueDirs["(single)"] = d
+	dir2instance[d] = "(single)"
     } else {
 	for _, dir := range(cfDirs) {
 	    masterCfs[dir] = dir + "/master.cf"
-	    queueDirs[dir] = e.RealSpool(parseMain(dir + "/main.cf"))
+	    d := e.RealSpool(parseMain(dir + "/main.cf"))
+	    queueDirs[dir] = d
+	    dir2instance[d] = dir
 	}
     }
     i := 0
     p := &PostfixProc{}
+    p.instanceDirs = dir2instance
     p.sortedInstances = make([]string, len(queueDirs))
     p.maxValue = make(map[string]map[string]int)
     p.curValue = make(map[string]map[string]int)
@@ -402,7 +429,6 @@ func (e *Exporter) parseMulti() ([]QueueDir, *PostfixProc, error) {
 	    i += 1
 	}
     }
-    p.instanceDirs = queueDirs
 
     for instance, masterCf := range(masterCfs) {
 	p.ParseMasterCf(instance, masterCf) // ignore error
@@ -411,31 +437,7 @@ func (e *Exporter) parseMulti() ([]QueueDir, *PostfixProc, error) {
 }
 
 func (e *Exporter) WalkProc(p *PostfixProc) error {
-    uid := os.Getuid()
-    var uuid uint32
-    if uid < 1 {
-	uuid = 0
-    } else {
-	uuid = uint32(uid)
-    }
-    return p.WalkProc(e.procDir, uuid)
-}
-
-func (e *Exporter) getProc(masterCfs map[string]string ) (*PostfixProc, error) {
-    p := &PostfixProc{}
-    uid := os.Getuid()
-    var uuid uint32
-    if uid < 1 {
-	uuid = 0
-    } else {
-	uuid = uint32(uid)
-    }
-    err := p.WalkProc(e.procDir, uuid)
-    if (err != nil) { return nil, err }
-    for instance, masterCf := range masterCfs {
-	p.ParseMasterCf(instance, masterCf) // ignore error
-    }
-    return p, err
+    return p.WalkProc(e.procDir, e.uid)
 }
 
 func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
@@ -607,9 +609,10 @@ var (
 
     spoolDir  = flag.String("spooldir", "/var/spool/postfix/", "Postfix directory with queue directories")
     queueDirs = flag.String("queuedirs", "incoming active deferred bounce corrupt", "Space separated names of queues")
-    procDir   = flag.String("proc", "/proc", "procfs mount directory")
+    procDir   = flag.String("proc", "/proc", "procfs mount directory, needs to run as root, to see working directories of processes")
     masterCf  = flag.String("mastercf", "/etc/postfix/master.cf", "Postfix master.cf, to parse maximum number of processes")
     multiCf   = flag.String("multicf", "/etc/postfix/main.cf", "Postfix main.cf, to parse for postfix multi_instance_enable");
+    userName  = flag.String("user", "postfix", "Scan processes belonging to this username (only if launched as root)")
 )
 
 func main() { // {{{
@@ -617,8 +620,27 @@ func main() { // {{{
 
     flag.Parse()
 
-    exporter := NewExporter(*spoolDir, *queueDirs, *masterCf, *multiCf, *procDir)
+    uid := os.Getuid()
+    if (uid == 0) {
+	if (*userName == "-") {
+	    uid = -1
+	} else {
+	    u, err := user.Lookup(*userName)
+	    if (err != nil) {
+		fmt.Fprintf(os.Stderr, "Cannot find user " + *userName + ": " + err.Error())
+		os.Exit(1)
+	    }
+	    uid, err = strconv.Atoi(u.Uid)
+	    if (err != nil) {
+		fmt.Fprintf(os.Stderr, "Error converting userid of " + *userName + ": " + err.Error())
+		os.Exit(1)
+	    }
+	}
+    }
+
+    exporter := NewExporter(*spoolDir, *queueDirs, *masterCf, *multiCf, *procDir, uid)
     if *influx {
+	debug = true
 	exporter.Influxdb(os.Stdout);
 	os.Exit(0);
 	return
@@ -628,6 +650,7 @@ func main() { // {{{
     prometheus.MustRegister(version.NewCollector(namespace))
 
     if *test {
+	debug = true
 	// Run full prometheus gather and print to stdout
 	gth := prometheus.DefaultGatherer
 	mfs, err := gth.Gather()
